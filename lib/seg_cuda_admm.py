@@ -2,7 +2,9 @@
 #Image segmentation on CUDA #
 #############################
 
-#Lansdell 2016
+#				  #
+## Lansdell 2016 ##
+#				  #
 
 import numpy as np
 from jinja2 import Template 
@@ -14,9 +16,9 @@ try:
 	import pycuda.driver as cuda_driver
 	import pycuda
 	import pycuda.autoinit
+	BLOCK_SIZE = 256
 	from pycuda.compiler import SourceModule
 	import pycuda.gpuarray as gpuarray
-	BLOCK_SIZE = 256
 	print '...success'
 except:
 	print "...pycuda not installed"
@@ -26,19 +28,17 @@ def softmax(x, alpha):
 	return max(x-alpha,0)
 
 class GPUChambolle:
-	def __init__(self, x, y, z, tau, sigma, theta, rho, f, n_iter = 100, eps = 1e-6):
+	def __init__(self, x, y, tau, sigma, theta, f, n_iter = 100, eps = 1e-6):
 
 		self.width, self.height, self.nK, self.nL = x.shape
 
 		self.x = x.astype(np.float32) 
 		self.y = y.astype(np.float32) 
-		self.z = z.astype(np.float32) 
 		self.f = f.astype(np.float32) 
 
 		self.tau = tau 
 		self.sigma = sigma 
 		self.theta = theta 
-		self.rho = rho 
 
 		self.n_iter = n_iter 
 		self.eps = eps 
@@ -331,7 +331,7 @@ class GPUChambolle:
 		//	output_x_gpu.gpudata, np.uint32(nElements), np.uint32(self.width), np.uint32(self.height),\
 		//	np.uint32(self.nK), np.uint32(self.nL))
 
-		__global__ void project_unitsimplex(float *x, float *y, float *z, float *f,
+		__global__ void project_unitsimplex(float *x, float *y, float *f,
 			float *x_out, int nElements, int width, int height, int nK, int nL)
 		{
 		    int globt = blockIdx.x*blockDim.x + threadIdx.x;
@@ -362,7 +362,7 @@ class GPUChambolle:
 					//x = unitsimplex(x - tau*(div(y)+z+f))//
 					for (int k = 0; k < nK; k++) {
 	    				idx = str_w*i+str_h*j+str_k*k+l;
-						ax[thr*nK + k] = x[idx] - tau * (divergence(y,i,j,k,l,width,height,nK,nL)+z[idx]+f[idx]);
+						ax[thr*nK + k] = x[idx] - tau * (-divergence(y,i,j,k,l,width,height,nK,nL)+f[idx]);
 					}
 
 					//unitsimplex(ax, nK, rx, thr);
@@ -383,10 +383,8 @@ class GPUChambolle:
 							uv[thr*nK + k] = ax[thr*nK + k];
 						}
 
-						//Merge sort 
-						//sort(0, nK, uv, b, thr);
-
 						//Just use insertion sort instead...
+						//Pseudo-code
 						//for i = 1 to length(A)
     					//	j = i
     					//	while j > 0 and A[j-1] > A[j]
@@ -557,7 +555,7 @@ class GPUChambolle:
 		self.cuda_unitball = cuda_module.get_function("unitball")
 		self.cuda_unitsimplex = cuda_module.get_function("project_unitsimplex")
 		self.cuda_unitball.prepare("PPPiiiii")
-		self.cuda_unitsimplex.prepare("PPPPPiiiii")
+		self.cuda_unitsimplex.prepare("PPPPiiiii")
 
 		#self.cuda_test = cuda_module.get_function("hello")
 		#self.cuda_test.prepare("PP")
@@ -574,7 +572,6 @@ class GPUChambolle:
 		x_bar_gpu = gpuarray.to_gpu(self.x)
 		x_old_gpu = gpuarray.to_gpu(self.x)
 		y_gpu = gpuarray.to_gpu(self.y)
-		z_gpu = gpuarray.to_gpu(self.z)
 		f_gpu = gpuarray.to_gpu(self.f)
 
 		x = self.x 
@@ -602,35 +599,6 @@ class GPUChambolle:
 			if (err < self.eps) and (n > 0):
 				break
 
-			#######################################
-			##Compute group LASSO term on the GPU##
-			#######################################
-			z = z_gpu.get()
-			x_bar = x_bar_gpu.get()
-			ps_norm_gpu = []
-			for k in range(self.nK):
-				ps_norm = np.zeros((nBlocks,1), dtype=np.float32)
-				ps_norm_gpu.append(gpuarray.to_gpu(ps_norm))
-			#These can be launched separately and synchronized later
-			for k in range(self.nK):
-				self.cuda_glasso.prepared_call(grid_dimensions, block_dimensions,\
-					z_gpu.gpudata, x_bar_gpu.gpudata, ps_norm_gpu[k].gpudata, np.uint32(k),\
-					np.uint32(nElements), np.uint32(self.width), np.uint32(self.height),\
-					np.uint32(self.nK), np.uint32(self.nL))
-			cuda_driver.Context.synchronize()
-
-			for k in range(self.nK):
-				ps_norm = ps_norm_gpu[k].get()
-				grp_norm = np.sqrt(np.sum(ps_norm[0:np.ceil(nBlocks/2.)]))
-				#Update z
-				if grp_norm > 0:
-					print grp_norm 
-					z[:,:,k,:] = (z[:,:,k,:]+self.sigma*x_bar[:,:,k,:])*softmax(grp_norm, self.rho)/grp_norm
-			#Once finished reupload z to GPU
-			z_gpu = gpuarray.to_gpu(z)
-
-			print np.linalg.norm(z)
-
 			################################
 			##Compute remainder of updates##
 			################################
@@ -646,14 +614,14 @@ class GPUChambolle:
 
 			#x = unitsimplex(x - tau*(div(y)+z+f))
 			self.cuda_unitsimplex.prepared_call(grid_dimensions, block_dimensions,\
-				x_gpu.gpudata, output_y_gpu.gpudata, z_gpu.gpudata, f_gpu.gpudata,\
+				x_gpu.gpudata, output_y_gpu.gpudata, f_gpu.gpudata,\
 				output_x_gpu.gpudata, np.uint32(nElements), np.uint32(self.width), np.uint32(self.height),\
 				np.uint32(self.nK), np.uint32(self.nL))
 			cuda_driver.Context.synchronize()
 
 			x = output_x_gpu.get() 
 			y = output_y_gpu.get()
-			x_bar = x + theta*(x - x_old)
+			x_bar = x + self.theta*(x - x_old)
 
 			#Reupload changes
 			#x_gpu = output_x_gpu 

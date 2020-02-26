@@ -1,108 +1,128 @@
 #!/usr/bin/env python
 import sys, os
-from renderer import VideoStream, FlowStream
-from kalman import IteratedMSKalmanFilter
-from distmesh_dyn import DistMesh
+from lib.renderer import VideoStream, TIFFStream
+from lib.distmesh_dyn import DistMesh
 from scipy.io import loadmat 
 
+import h5py 
 import cv2 
 import numpy as np 
+import argparse
+import gc 
+import cv2
+from lib.imgproc import drawGrid, findObjectThreshold
 
-fn_in='../hydra/video/johntest_brightcontrast_short_jpg.avi'
-name='johntest_brightcontrast_short'
-threshold = 15
-cuda = True
-gridsize = 25
+def main():
+	usage = """meshfmsf.py [vid_in] [flow_in] -threshold THRESH -gridsize GRIDSIZE
 
-#mfsf_in = './mfsf_output/stk_0001_mfsf_nref100/'
-#mfsf_in = './mfsf_output/johntest_flag_STD_0_alpha_20_flag_grad_1_nref100/'
-mfsf_in = './mfsf_output/johntest_nref190/'
-dm_out = 'init_mesh.pkl'
+	Visualize results of MFSF run by meshing an object and 'tracking' it
+		
+	Ben Lansdell
+	02/21/2017
+	"""
+	
+	parser = argparse.ArgumentParser()
+	parser.add_argument('vid_in', help='output mat file')
+	parser.add_argument('flow_in', help='input mat files from MFSF')
+	parser.add_argument('-threshold', help='intensities below this are not meshed', default=25)
+	parser.add_argument('-gridsize', help='approximate gridsize for mesh', default=25)
+	args = parser.parse_args()
+	
+	#Test code
+	#fn_in='../hydra/video/20170202/20170202_8bit.tif'	
+	#mfsf_in = './mfsf_output/20170202_16bit/'
+	#gridsize = 50
+	#threshold = 15
 
-imageoutput = mfsf_in + '/mesh/'
-#Make directory if needed...
-if not os.path.exists(imageoutput):
-    os.makedirs(imageoutput)
+	mfsf_in = args.flow_in
+	fn_in = args.vid_in
+	threshold = args.threshold 
+	gridsize = args.gridsize
 
-#Load MFSF data
-a = loadmat(mfsf_in + '/result.mat')
+	dm_out = 'init_mesh.pkl'
+	cuda = False
 
-params = a['parmsOF']
-u = a['u']
-v = a['v']
+	#Skip to this frame and create mesh 
+	capture = TIFFStream(fn_in, threshold)
+	nx = capture.nx
+	nF = capture.nframes
 
-#Find reference frame 
-nref = params['nref'][0,0][0,0]
+	#Load MFSF data
+	try:
+		a = loadmat(mfsf_in + '/result.mat')
+		params = a['parmsOF']
+		u = a['u']
+		v = a['v']
+		#Find reference frame 
+		nref = params['nref'][0,0][0,0]
+	except NotImplementedError:
+		#Load using HDF package instead. This happens if the file is too big and had to be
+		#saved using MATLAB's -v7.3 flag
+		print "Failed to read using loadmat, using hdf5 library to read %s"%mfsf_in
+		f = h5py.File(mfsf_in + '/result.mat','r')
+		#Note the x and y axes may need to be switched here...
+		#u = np.transpose(np.array(f.get('u')), (1,2,0))
+		#v = np.transpose(np.array(f.get('v')), (1,2,0))
+		u = np.transpose(np.array(f.get('u')), (2,1,0))
+		v = np.transpose(np.array(f.get('v')), (2,1,0))
+		params = f.get('parmsOF')
+		nref = int(params['nref'][0][0])
+	print "Loaded MFSF data"
 
-#Skip to this frame and create mesh 
-capture = VideoStream(fn_in, threshold)
+	for idx in range(nF):
+		print 'Loading frame', idx
+		ret, frame, mask = capture.read()
+		if idx == nref:
+			refframe = frame.copy()
+			tracking_mask = mask
+	
+	(mask, ctrs, fd) = findObjectThreshold(tracking_mask, threshold = .5)
+	
+	distmesh = DistMesh(refframe, h0 = gridsize)
+	if not os.path.exists(mfsf_in + dm_out):
+		distmesh.createMesh(ctrs, fd, refframe, plot = False)
+		#Save this distmesh and reload it for quicker testing
+		distmesh.save(mfsf_in + dm_out)
+	else:
+		distmesh.load(mfsf_in + dm_out)
+	
+	refpositions = distmesh.p
+	
+	#Perturb mesh points according to MFSF flow field and save screenshot output
+	nF = min(u.shape[2], nF)
 
-nx = int(capture.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-nF = int(capture.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+	del capture
+	gc.collect()
 
-vid = np.zeros((nx, nx, nF))
-masks = np.zeros((nx, nx, nF))
-for idx in range(nF):
-	print 'Loading frame', idx
-	ret, frame, grayframe, mask = capture.read()
-	if idx == nref:
-		mask, ctrs, fd = capture.backsub()
-		refframe = frame 
-	vid[:,:,idx] = grayframe 
-	masks[:,:,idx] = mask
+	imageoutput = mfsf_in + 'mesh/'
+	#Make directory if needed...
+	if not os.path.exists(imageoutput):
+	    os.makedirs(imageoutput)
+	
+	capture2 = TIFFStream(fn_in, threshold)
+	
+	for idx in range(nF):
+		#Update positions based on reference positions and flow field
+		print("Visualizing frame %d" % idx)
+		ret, frame, mask = capture2.read() 
+		dx = u[refpositions[:,1].astype(int), refpositions[:,0].astype(int), idx]
+		dy = v[refpositions[:,1].astype(int), refpositions[:,0].astype(int), idx]
+		X = refpositions.copy()
+		X[:,0] += dx
+		X[:,1] += dy
+		frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+		drawGrid(frame, X/4, distmesh.bars, L = None, F = None)
+		cv2.imwrite(imageoutput + 'frame_%03d.png'%idx, frame)
+		
+	#Make a video
+	print 'Making movie'
+	overlayoutput = mfsf_in + 'mesh_overlay/'
+	if not os.path.exists(overlayoutput):
+	    os.makedirs(overlayoutput)
+	
+	#avconv = 'avconv -i ' + imageoutput + 'frame_%03d.png -c:v mpeg4 -qscale 8 -y'
+	avconv = 'avconv -i ' + imageoutput + 'frame_%03d.png -c:v mpeg4 -qscale 29 -y'
+	os.system(avconv + ' ' + overlayoutput + 'output.mp4')
 
-#distmesh = DistMesh(refframe, h0 = gridsize)
-#distmesh.createMesh(ctrs, fd, refframe, plot = True)
-#Save this distmesh and reload it for quicker testing
-#distmesh.save(mfsf_in + dm_out)
-
-distmesh = DistMesh(refframe, h0 = gridsize)
-distmesh.load(mfsf_in + dm_out)
-
-refpositions = distmesh.p
-
-#Create dummy input for flow frame
-flowframe = np.zeros((nx, nx, 2))
-
-#Create Kalman Filter object to store mesh and make use of plotting functions
-kf = IteratedMSKalmanFilter(distmesh, refframe, flowframe, cuda = cuda)
-
-#Perturb mesh points according to MFSF flow field and save screenshot output
-nF = u.shape[2]
-N = kf.size()/4
-
-for idx in range(nF):
-	#capture.seek(idx)
-	#Update positions based on reference positions and flow field
-	print("Visualizing frame %d" % idx)
-	#ret, frame, y_im, y_m = capture2.read()
-	y_im = vid[:,:,idx].astype(np.dtype('uint8'))
-	y_m = masks[:,:,idx].astype(np.dtype('uint8'))
-	#if not ret:
-	#	print("End of stream encountered")
-	#	break 
-	kf.state.renderer.update_frame(y_im, flowframe, y_m)
-	dx = u[refpositions[:,1].astype(int), refpositions[:,0].astype(int), idx]
-	dy = v[refpositions[:,1].astype(int), refpositions[:,0].astype(int), idx]
-	X = refpositions.copy()
-	X[:,0] += dx
-	X[:,1] += dy
-	kf.state.X[0:2*N] = np.reshape(X, (-1,1))
-	kf.state.refresh()
-	kf.state.render()
-	kf.state.renderer.screenshot(saveall=True, basename = imageoutput + '_frame_%03d' % idx)
-
-
-#Make a video
-print 'Making movie'
-overlayoutput = mfsf_in + '/mesh_overlay/'
-if not os.path.exists(overlayoutput):
-    os.makedirs(overlayoutput)
-
-for idx in range(nF):
-	os.system('cp ' + imageoutput + '_frame_%03d_overlay* '%idx + overlayoutput+'frame_%03d.png'%idx)
-
-avconv = 'avconv -framerate 5 -i ' + overlayoutput + 'frame_%03d.png -c:v huffyuv -y'
-os.system(avconv + ' ' + overlayoutput + 'output.avi')
-
-avconv -i frame_%03d.png -c:v huffyuv output.avi
+if __name__ == "__main__":
+	sys.exit(main())

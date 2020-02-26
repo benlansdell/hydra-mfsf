@@ -6,4 +6,6 @@ end
 
 addpath([homedir 'lansdell/projects/hydra-mfsf/mfsf']);
 addpath([homedir 'lansdell/projects/hydra-mfsf/scripts']);
+addpath([homedir 'lansdell/projects/hydra-mfsf/functions']);
 addpath_recurse([homedir 'lansdell/matlab/mfsf']);
+addpath_recurse([homedir 'lansdell/matlab/gmmreg/MATLAB']);
